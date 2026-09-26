@@ -75,6 +75,124 @@ func TestSweepNegativeSideMirrors(t *testing.T) {
 	}
 }
 
+// When the requested window does not contain the curve peak, the reported
+// peak slip must be the window boundary carrying the largest |Fx| — never a
+// slip outside [min, max]. These cases lock the regression where golden-
+// section refinement stepped past the window edge.
+func TestSweepPeakRespectsWindowBounds(t *testing.T) {
+	c, fz := demoLike(t)
+	cases := []struct {
+		name      string
+		spec      SweepSpec
+		wantSlip  float64
+		wantForce float64 // ballpark value (single-point evaluation gives the exact check)
+	}{
+		{
+			name:      "peak_at_upper_endpoint",
+			spec:      SweepSpec{Min: 0.02, Max: 0.12, Points: 11},
+			wantSlip:  0.12,
+			wantForce: 3925.36,
+		},
+		{
+			// Dense grid: previously the refinement overshot by ~one step.
+			name:      "peak_at_upper_endpoint_dense_grid",
+			spec:      SweepSpec{Min: 0.02, Max: 0.12, Points: 2000},
+			wantSlip:  0.12,
+			wantForce: 3925.36,
+		},
+		{
+			name:      "peak_at_lower_endpoint_behind_curve_peak",
+			spec:      SweepSpec{Min: 0.3, Max: 0.8, Points: 11},
+			wantSlip:  0.3,
+			wantForce: 3943.01,
+		},
+		{
+			name:      "peak_at_lower_endpoint_braking",
+			spec:      SweepSpec{Min: -0.12, Max: -0.02, Points: 11},
+			wantSlip:  -0.12,
+			wantForce: -3925.36,
+		},
+		{
+			name:      "peak_at_lower_endpoint_braking_dense_grid",
+			spec:      SweepSpec{Min: -0.12, Max: -0.02, Points: 2000},
+			wantSlip:  -0.12,
+			wantForce: -3925.36,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := SweepPeak(c, fz, tc.spec)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if res.PeakSlip < tc.spec.Min || res.PeakSlip > tc.spec.Max {
+				t.Fatalf("peak slip %v outside requested window [%v, %v]",
+					res.PeakSlip, tc.spec.Min, tc.spec.Max)
+			}
+			if res.PeakSlip != tc.wantSlip {
+				t.Fatalf("peak slip %v, want exact endpoint %v", res.PeakSlip, tc.wantSlip)
+			}
+			if !almostEqual(res.PeakForce, tc.wantForce, 1e-4) {
+				t.Fatalf("peak force %v, want ~%v", res.PeakForce, tc.wantForce)
+			}
+
+			// The reported force must equal the single-point formula at the
+			// reported slip, exactly.
+			force, _, err := LongitudinalForce(c, fz, res.PeakSlip)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if force != res.PeakForce {
+				t.Fatalf("single-point re-evaluation %v != reported peak force %v",
+					force, res.PeakForce)
+			}
+
+			// It must also be the maximum |Fx| over the whole window.
+			const dense = 100001
+			maxAbs := -1.0
+			for i := 0; i < dense; i++ {
+				k := tc.spec.Min + (tc.spec.Max-tc.spec.Min)*float64(i)/float64(dense-1)
+				if a := math.Abs(Evaluate(c, res.PeakAmplitude, k)); a > maxAbs {
+					maxAbs = a
+				}
+			}
+			if math.Abs(res.PeakForce) < maxAbs*(1-1e-9) {
+				t.Fatalf("reported |force| %v is below window maximum %v",
+					math.Abs(res.PeakForce), maxAbs)
+			}
+			if math.Signbit(res.PeakForce) != math.Signbit(tc.wantForce) {
+				t.Fatalf("force %v has the wrong sign for endpoint slip %v",
+					res.PeakForce, tc.wantSlip)
+			}
+		})
+	}
+}
+
+// A direct peak amplitude D (instead of mu * Fz) must obey the same window
+// bounds — the refinement fix lives after D is resolved.
+func TestSweepPeakRespectsWindowBoundsDirectAmplitude(t *testing.T) {
+	d := 5000.0
+	c := Coefficients{Stiffness: 12, Shape: 1.65, Curvature: 0.9, Peak: &d}
+	spec := SweepSpec{Min: 0.02, Max: 0.12, Points: 11}
+	res, err := SweepPeak(c, 4500, spec)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.PeakSlip != 0.12 {
+		t.Fatalf("peak slip %v, want 0.12", res.PeakSlip)
+	}
+	if res.PeakSlip < spec.Min || res.PeakSlip > spec.Max {
+		t.Fatalf("peak slip %v outside window", res.PeakSlip)
+	}
+	force, _, err := LongitudinalForce(c, 4500, res.PeakSlip)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if force != res.PeakForce {
+		t.Fatalf("single-point force %v != reported peak force %v", force, res.PeakForce)
+	}
+}
+
 func TestSweepRejectsInvalidSpec(t *testing.T) {
 	c, fz := demoLike(t)
 	for _, spec := range []SweepSpec{
