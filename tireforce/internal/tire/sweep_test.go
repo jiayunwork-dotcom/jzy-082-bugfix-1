@@ -75,6 +75,140 @@ func TestSweepNegativeSideMirrors(t *testing.T) {
 	}
 }
 
+// A narrow window entirely on the rising flank of the curve must report
+// the upper endpoint as the peak: the true curve peak (~0.18 for the demo
+// parameters) lies outside the window, so the search must not chase it.
+func TestSweepWindowBeforePeakReportsUpperEndpoint(t *testing.T) {
+	c, fz := demoLike(t)
+	spec := SweepSpec{Min: 0.02, Max: 0.12, Points: 11}
+	res, err := SweepPeak(c, fz, spec)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.PeakSlip != spec.Max {
+		t.Fatalf("peak slip %v, want upper endpoint %v", res.PeakSlip, spec.Max)
+	}
+	want := Evaluate(c, res.PeakAmplitude, spec.Max)
+	if res.PeakForce != want {
+		t.Fatalf("peak force %v, want force at upper endpoint %v", res.PeakForce, want)
+	}
+	if wantForce := 3925.3606934482364; !almostEqual(res.PeakForce, wantForce, 1e-9) {
+		t.Fatalf("peak force %v, want ~%v", res.PeakForce, wantForce)
+	}
+	// Re-evaluation through the single-point formula must agree exactly.
+	f, _, err := LongitudinalForce(c, fz, res.PeakSlip)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if f != res.PeakForce {
+		t.Fatalf("single-point re-evaluation %v != sweep peak force %v", f, res.PeakForce)
+	}
+}
+
+// The braking-side mirror: a negative window on the rising (|Fx|) flank
+// must report the lower (most negative) endpoint, with negative force.
+func TestSweepWindowBeforePeakReportsLowerEndpointBraking(t *testing.T) {
+	c, fz := demoLike(t)
+	spec := SweepSpec{Min: -0.12, Max: -0.02, Points: 11}
+	res, err := SweepPeak(c, fz, spec)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.PeakSlip != spec.Min {
+		t.Fatalf("peak slip %v, want lower endpoint %v", res.PeakSlip, spec.Min)
+	}
+	want := Evaluate(c, res.PeakAmplitude, spec.Min)
+	if res.PeakForce != want {
+		t.Fatalf("peak force %v, want force at lower endpoint %v", res.PeakForce, want)
+	}
+	if wantForce := -3925.3606934482364; !almostEqual(res.PeakForce, wantForce, 1e-9) {
+		t.Fatalf("peak force %v, want ~%v", res.PeakForce, wantForce)
+	}
+	if res.PeakForce >= 0 {
+		t.Fatalf("braking-side peak force %v must be negative", res.PeakForce)
+	}
+}
+
+// A window entirely on the falling flank past the peak must report the
+// lower endpoint.
+func TestSweepWindowAfterPeakReportsLowerEndpoint(t *testing.T) {
+	c, fz := demoLike(t)
+	spec := SweepSpec{Min: 0.3, Max: 0.8, Points: 11}
+	res, err := SweepPeak(c, fz, spec)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.PeakSlip != spec.Min {
+		t.Fatalf("peak slip %v, want lower endpoint %v", res.PeakSlip, spec.Min)
+	}
+	want := Evaluate(c, res.PeakAmplitude, spec.Min)
+	if res.PeakForce != want {
+		t.Fatalf("peak force %v, want force at lower endpoint %v", res.PeakForce, want)
+	}
+	if wantForce := 3943.00966256311; !almostEqual(res.PeakForce, wantForce, 1e-9) {
+		t.Fatalf("peak force %v, want ~%v", res.PeakForce, wantForce)
+	}
+}
+
+// No matter how the window is placed, the reported peak must lie inside
+// the requested interval (endpoints included) and its |Fx| must equal the
+// maximum |Fx| over a dense sampling of that interval.
+func TestSweepResultStaysInsideWindow(t *testing.T) {
+	c, fz := demoLike(t)
+	windows := []SweepSpec{
+		{Min: 0.02, Max: 0.12, Points: 11},
+		{Min: -0.12, Max: -0.02, Points: 11},
+		{Min: 0.3, Max: 0.8, Points: 11},
+		{Min: 0.02, Max: 0.12, Points: 2000},
+		{Min: 0.1, Max: 0.25, Points: 11}, // window containing the true peak
+		{Min: -0.5, Max: 0.5, Points: 50},
+	}
+	for _, spec := range windows {
+		res, err := SweepPeak(c, fz, spec)
+		if err != nil {
+			t.Fatalf("window [%v, %v]: unexpected error: %v", spec.Min, spec.Max, err)
+		}
+		if res.PeakSlip < spec.Min || res.PeakSlip > spec.Max {
+			t.Fatalf("window [%v, %v]: peak slip %v outside interval", spec.Min, spec.Max, res.PeakSlip)
+		}
+		const dense = 10000
+		maxAbs := -1.0
+		for i := 0; i <= dense; i++ {
+			k := spec.Min + (spec.Max-spec.Min)*float64(i)/float64(dense)
+			a := math.Abs(Evaluate(c, res.PeakAmplitude, k))
+			if a > maxAbs {
+				maxAbs = a
+			}
+		}
+		// The refined peak may exceed the dense-grid maximum by a hair; the
+		// dense grid must never beat the reported result.
+		if math.Abs(res.PeakForce) < maxAbs-1e-9 {
+			t.Fatalf("window [%v, %v]: peak force |%v| below dense-grid max %v",
+				spec.Min, spec.Max, res.PeakForce, maxAbs)
+		}
+	}
+}
+
+// The same windowing guarantee must hold when the peak amplitude D is
+// given directly instead of being derived from friction and load.
+func TestSweepWindowedDirectPeakReportsEndpoint(t *testing.T) {
+	d := 5000.0
+	c := Coefficients{Stiffness: 10, Shape: 1.9, Curvature: 0.97, Peak: &d}
+	res, err := SweepPeak(c, 4500, SweepSpec{Min: 0.02, Max: 0.12, Points: 11})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.PeakSlip != 0.12 {
+		t.Fatalf("peak slip %v, want 0.12", res.PeakSlip)
+	}
+	if res.PeakAmplitude != d {
+		t.Fatalf("peak amplitude %v, want %v", res.PeakAmplitude, d)
+	}
+	if res.PeakForce >= d {
+		t.Fatalf("windowed peak force %v must stay below amplitude %v", res.PeakForce, d)
+	}
+}
+
 func TestSweepRejectsInvalidSpec(t *testing.T) {
 	c, fz := demoLike(t)
 	for _, spec := range []SweepSpec{

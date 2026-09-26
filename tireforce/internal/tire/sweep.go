@@ -32,8 +32,12 @@ var ErrSweepIncomplete = errors.New("sweep did not complete")
 // SweepPeak scans the slip interval for the point of maximum |Fx| and
 // returns it as the curve peak.
 //
-// The scan evaluates the very same curve as the single-point path
-// (Evaluate with D from PeakAmplitude), and the reported peak force is
+// The reported peak is always a point of the requested interval: the search
+// never leaves [spec.Min, spec.Max], and both interval endpoints are
+// evaluated explicitly, so a window that does not contain the true curve
+// peak reports whichever endpoint carries the larger |Fx| (endpoints
+// included). The scan evaluates the very same curve as the single-point
+// path (Evaluate with D from PeakAmplitude), and the reported peak force is
 // re-evaluated at the reported peak slip with that same formula — so
 // LongitudinalForce(c, fz, result.PeakSlip) reproduces result.PeakForce
 // exactly.
@@ -60,24 +64,42 @@ func SweepPeak(c Coefficients, verticalLoad float64, spec SweepSpec) (PeakResult
 		return math.Abs(f), nil
 	}
 
-	// Coarse uniform scan.
+	// Coarse uniform scan. Both interval endpoints are evaluated as
+	// explicit candidates: the interior grid's last point is only an
+	// approximation of spec.Max in floating point, and a monotonic window
+	// must report the exact endpoint rather than a neighbouring grid value.
 	n := spec.Points
 	step := (spec.Max - spec.Min) / float64(n-1)
-	bestSlip, bestAbs := math.NaN(), -1.0
-	for i := 0; i < n; i++ {
-		kappa := spec.Min + float64(i)*step
+	bestSlip, bestAbs := spec.Min, math.Inf(-1)
+	consider := func(kappa float64) error {
 		a, err := absForce(kappa)
 		if err != nil {
-			return PeakResult{}, err
+			return err
 		}
 		if a > bestAbs {
 			bestAbs, bestSlip = a, kappa
 		}
+		return nil
+	}
+	if err := consider(spec.Min); err != nil {
+		return PeakResult{}, err
+	}
+	for i := 1; i < n-1; i++ {
+		if err := consider(spec.Min + float64(i)*step); err != nil {
+			return PeakResult{}, err
+		}
+	}
+	if err := consider(spec.Max); err != nil {
+		return PeakResult{}, err
 	}
 
 	// Golden-section refinement on the bracket around the best grid point.
-	lo := math.Max(-NormalSlipLimit, bestSlip-step)
-	hi := math.Min(NormalSlipLimit, bestSlip+step)
+	// The bracket is clamped to the requested interval: refinement never
+	// samples a slip the caller did not ask for, so a window whose optimum
+	// sits at (or beyond) an endpoint converges to that endpoint instead of
+	// wandering outside the window.
+	lo := math.Max(spec.Min, bestSlip-step)
+	hi := math.Min(spec.Max, bestSlip+step)
 	if hi > lo {
 		refined, err := goldenSectionMax(func(k float64) float64 {
 			a, err := absForce(k)
@@ -92,8 +114,16 @@ func SweepPeak(c Coefficients, verticalLoad float64, spec SweepSpec) (PeakResult
 		if a, err := absForce(refined); err != nil {
 			return PeakResult{}, err
 		} else if a >= bestAbs {
-			bestSlip = refined
+			bestAbs, bestSlip = a, refined
 		}
+	}
+
+	// Defensive clamp: the reported slip must always lie in the requested
+	// interval, endpoints included.
+	if bestSlip < spec.Min {
+		bestSlip = spec.Min
+	} else if bestSlip > spec.Max {
+		bestSlip = spec.Max
 	}
 
 	// Final re-evaluation with the single-point formula: the reported peak

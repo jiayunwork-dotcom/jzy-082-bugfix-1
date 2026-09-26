@@ -132,6 +132,92 @@ func TestPeakEndpointConsistentWithForce(t *testing.T) {
 	}
 }
 
+// A sweep window that does not contain the true curve peak must keep the
+// reported peak inside the requested interval and report the endpoint
+// maximum, not the out-of-window curve peak.
+func TestPeakEndpointRespectsSweepWindow(t *testing.T) {
+	r := NewRouter()
+	rec, body := doRequest(t, r, http.MethodPost, "/api/v1/longitudinal/peak", map[string]any{
+		"vertical_load": 4000.0,
+		"coefficients":  map[string]any{"stiffness": 10.0, "shape": 1.9, "curvature": 0.97, "friction": 1.0},
+		"sweep":         map[string]any{"min": 0.02, "max": 0.12, "points": 11},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, body %v", rec.Code, body)
+	}
+	peakSlip := body["peak_slip"].(float64)
+	peakForce := body["peak_force"].(float64)
+	if peakSlip < 0.02 || peakSlip > 0.12 {
+		t.Fatalf("peak slip %v reported outside sweep window [0.02, 0.12]", peakSlip)
+	}
+	if peakSlip != 0.12 {
+		t.Fatalf("peak slip %v, want upper endpoint 0.12", peakSlip)
+	}
+	if !within(peakForce, 3925.3606934482364, 1e-9) {
+		t.Fatalf("peak force %v, want ~3925.36 (force at 0.12)", peakForce)
+	}
+
+	// Single-point re-evaluation at the reported slip must agree exactly.
+	_, single := doRequest(t, r, http.MethodPost, "/api/v1/longitudinal/force", demoPayload(4000, peakSlip))
+	if single["longitudinal_force"].(float64) != peakForce {
+		t.Fatalf("single-point force %v != sweep peak force %v",
+			single["longitudinal_force"], peakForce)
+	}
+}
+
+// Braking-side window: the most negative endpoint carries the largest
+// |Fx| and must be reported as the peak.
+func TestPeakEndpointRespectsBrakingWindow(t *testing.T) {
+	r := NewRouter()
+	rec, body := doRequest(t, r, http.MethodPost, "/api/v1/longitudinal/peak", map[string]any{
+		"vertical_load": 4000.0,
+		"coefficients":  map[string]any{"stiffness": 10.0, "shape": 1.9, "curvature": 0.97, "friction": 1.0},
+		"sweep":         map[string]any{"min": -0.12, "max": -0.02, "points": 11},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, body %v", rec.Code, body)
+	}
+	peakSlip := body["peak_slip"].(float64)
+	peakForce := body["peak_force"].(float64)
+	if peakSlip < -0.12 || peakSlip > -0.02 {
+		t.Fatalf("peak slip %v reported outside sweep window [-0.12, -0.02]", peakSlip)
+	}
+	if peakSlip != -0.12 {
+		t.Fatalf("peak slip %v, want lower endpoint -0.12", peakSlip)
+	}
+	if !within(peakForce, -3925.3606934482364, 1e-9) {
+		t.Fatalf("peak force %v, want ~-3925.36 (force at -0.12)", peakForce)
+	}
+}
+
+// Window past the true peak: the lower endpoint is the in-window maximum.
+func TestPeakEndpointRespectsFallingFlankWindow(t *testing.T) {
+	r := NewRouter()
+	rec, body := doRequest(t, r, http.MethodPost, "/api/v1/longitudinal/peak", map[string]any{
+		"vertical_load": 4000.0,
+		"coefficients":  map[string]any{"stiffness": 10.0, "shape": 1.9, "curvature": 0.97, "friction": 1.0},
+		"sweep":         map[string]any{"min": 0.3, "max": 0.8, "points": 11},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, body %v", rec.Code, body)
+	}
+	peakSlip := body["peak_slip"].(float64)
+	peakForce := body["peak_force"].(float64)
+	if peakSlip < 0.3 || peakSlip > 0.8 {
+		t.Fatalf("peak slip %v reported outside sweep window [0.3, 0.8]", peakSlip)
+	}
+	if peakSlip != 0.3 {
+		t.Fatalf("peak slip %v, want lower endpoint 0.3", peakSlip)
+	}
+	if !within(peakForce, 3943.00966256311, 1e-9) {
+		t.Fatalf("peak force %v, want ~3943.01 (force at 0.3)", peakForce)
+	}
+}
+
+func within(got, want, tol float64) bool {
+	return math.Abs(got-want) <= tol*math.Max(1, math.Abs(want))
+}
+
 func TestCurveEndpoint(t *testing.T) {
 	r := NewRouter()
 	rec, body := doRequest(t, r, http.MethodPost, "/api/v1/longitudinal/curve", map[string]any{
